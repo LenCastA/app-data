@@ -3,6 +3,9 @@
 
 import argparse
 import csv
+import re
+import unicodedata
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -46,6 +49,43 @@ def clean(value: object) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
+
+
+def clean_teacher_name(value: str) -> str:
+    return " ".join(value.replace("\u00a0", " ").split())
+
+
+def normalized_identity(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value)
+    without_marks = "".join(character for character in decomposed if not unicodedata.combining(character))
+    return " ".join(re.sub(r"[^A-Z0-9]+", " ", without_marks.upper()).split())
+
+
+def disambiguate_teacher_dni(rows: list[dict[str, str]]) -> int:
+    names_by_dni: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        row["nombre_docente"] = clean_teacher_name(row["nombre_docente"])
+        if row["dni_docente"]:
+            names_by_dni[row["dni_docente"]].append(row["nombre_docente"])
+
+    ambiguous = {
+        dni
+        for dni, names in names_by_dni.items()
+        if len({normalized_identity(name) for name in names}) > 1
+    }
+    canonical_names = {
+        dni: Counter(names).most_common(1)[0][0]
+        for dni, names in names_by_dni.items()
+        if dni not in ambiguous
+    }
+
+    for row in rows:
+        dni = row["dni_docente"]
+        if dni in ambiguous:
+            row["dni_docente"] = ""
+        elif dni:
+            row["nombre_docente"] = canonical_names[dni]
+    return len(ambiguous)
 
 
 def find_header(sheet) -> tuple[int, dict[str, int]]:
@@ -125,13 +165,14 @@ def convert(args: argparse.Namespace) -> int:
             }
         )
 
+    ambiguous_dni = disambiguate_teacher_dni(output)
     output.sort(key=lambda row: (row["codigo_curso"], row["seccion"], row["dia"], row["inicio"], row["tipo"]))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8", newline="") as target:
         writer = csv.DictWriter(target, fieldnames=OUTPUT_HEADERS, lineterminator="\n")
         writer.writeheader()
         writer.writerows(output)
-    print(f"generated: {args.output} ({len(output)} rows)")
+    print(f"generated: {args.output} ({len(output)} rows, {ambiguous_dni} ambiguous DNI omitted)")
     return 0
 
 
