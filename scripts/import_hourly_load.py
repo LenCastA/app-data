@@ -11,19 +11,39 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 
-SOURCE_HEADERS = {
+HEADER_ALIASES = {
+    "CODIGO": "course",
     "CÓDIGO": "course",
     "NOMBRE DEL CURSO": "course_name",
+    "SECCION": "section",
     "SECCIÓN": "section",
+    "SISTEMA DE EVALUACION": "evaluation",
     "SISTEMA DE EVALUACIÓN": "evaluation",
     "APELLIDOS Y NOMBRES DEL DOCENTE": "teacher",
+    "APELLIDOS Y NOMBRES DE DOCENTE": "teacher",
+    "TIPO": "session_type",
     "TIPO CLASE": "session_type",
     "AULA": "classroom",
+    "DIA": "day",
     "DÍA": "day",
     "HORA INICIO": "start",
     "HORA FINAL": "end",
     "DNI": "teacher_dni",
     "VACANTES": "vacancies",
+}
+
+REQUIRED_TARGETS = {
+    "course",
+    "course_name",
+    "section",
+    "evaluation",
+    "teacher",
+    "session_type",
+    "classroom",
+    "day",
+    "start",
+    "end",
+    "vacancies",
 }
 
 OUTPUT_HEADERS = [
@@ -43,9 +63,24 @@ OUTPUT_HEADERS = [
 ]
 
 
+import datetime
+
+
 def clean(value: object) -> str:
     if value is None:
         return ""
+    if isinstance(value, datetime.timedelta):
+        if value.seconds == 0 and value.days > 0:
+            return str(value.days)
+        total_hours = value.days * 24 + value.seconds // 3600
+        minutes = (value.seconds % 3600) // 60
+        if minutes == 0:
+            return str(total_hours)
+        return f"{total_hours:02d}:{minutes:02d}"
+    if isinstance(value, datetime.time):
+        return value.strftime("%H:%M")
+    if isinstance(value, datetime.datetime):
+        return value.strftime("%H:%M")
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
@@ -90,11 +125,15 @@ def disambiguate_teacher_dni(rows: list[dict[str, str]]) -> int:
 
 def find_header(sheet) -> tuple[int, dict[str, int]]:
     for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-        positions = {clean(value).upper(): index for index, value in enumerate(row)}
-        if SOURCE_HEADERS.keys() <= positions.keys():
-            return row_number, {
-                target: positions[source] for source, target in SOURCE_HEADERS.items()
-            }
+        positions = {}
+        for index, value in enumerate(row):
+            if value is None:
+                continue
+            norm = " ".join(clean(value).upper().split())
+            if norm in HEADER_ALIASES:
+                positions[HEADER_ALIASES[norm]] = index
+        if REQUIRED_TARGETS <= positions.keys():
+            return row_number, positions
     raise ValueError("No se encontró la cabecera esperada de la carga horaria")
 
 
@@ -117,26 +156,29 @@ def previous_fallbacks(path: Path | None) -> dict[tuple[str, ...], tuple[str, st
 
 def convert(args: argparse.Namespace) -> int:
     workbook = load_workbook(args.workbook, data_only=True, read_only=True)
-    sheet = workbook[args.sheet] if args.sheet else workbook.worksheets[0]
+    sheet = workbook[args.sheet] if args.sheet and args.sheet in workbook.sheetnames else workbook.worksheets[0]
     header_row, columns = find_header(sheet)
     fallbacks = previous_fallbacks(args.previous)
     output: list[dict[str, str]] = []
 
-    required = ("course", "course_name", "section", "evaluation", "day", "start", "end")
+    required = ("course", "course_name", "section", "day", "start", "end")
     for source_row_number, values in enumerate(
         sheet.iter_rows(min_row=header_row + 1, values_only=True), start=header_row + 1
     ):
         row = {
-            name: clean(values[index] if index < len(values) else None)
+            name: clean(values[index] if index is not None and index < len(values) else None)
             for name, index in columns.items()
         }
+        if "teacher_dni" not in row:
+            row["teacher_dni"] = ""
         if not any(row.values()):
             continue
         missing = [name for name in required if not row[name]]
         if missing:
-            raise ValueError(
-                f"Fila {source_row_number}: faltan campos obligatorios: {', '.join(missing)}"
+            print(
+                f"Aviso fila {source_row_number}: omitiendo {row.get('course')} sec {row.get('section')} por campos faltantes: {', '.join(missing)}"
             )
+            continue
 
         key = (row["course"], row["section"], row["day"], row["start"], row["end"])
         previous_teacher, previous_type = fallbacks.get(key, ("", ""))
@@ -154,7 +196,7 @@ def convert(args: argparse.Namespace) -> int:
                 "nombre_curso": row["course_name"],
                 "seccion": row["section"],
                 "evaluacion": row["evaluation"],
-                "vacantes": row["vacancies"],
+                "vacantes": row["vacancies"] if row["vacancies"].strip().isdigit() else "0",
                 "inicio": row["start"],
                 "fin": row["end"],
                 "aula": row["classroom"],
